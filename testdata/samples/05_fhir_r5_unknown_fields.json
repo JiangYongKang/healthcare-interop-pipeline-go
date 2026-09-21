@@ -1,0 +1,17 @@
+{
+  "fhirVersion": "R5",
+  "id": "E-003",
+  "identifier": {"use": "event-id", "system": "HOSP", "value": "E-003"},
+  "event": {"type": "OBS_RESULT", "sequence": 30, "futureScore": 0.91},
+  "subject": {
+    "identifier": {"system": "HOSP", "value": "MRN-1001"},
+    "name": [{"family": "Chen", "given": ["Alice"]}],
+    "gender": "female",
+    "birthDate": "1984-05-06",
+    "telecom": [{"value": "555-1234"}],
+    "novelLink": {"code": "X9"}
+  },
+  "effectiveDateTime": "2026-09-03T09:00:00Z",
+  "notes": "follow-up",
+  "experimentalExtension": {"a": 1}
+}

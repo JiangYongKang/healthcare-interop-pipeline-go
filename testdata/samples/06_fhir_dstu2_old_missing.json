@@ -1,0 +1,12 @@
+{
+  "fhirVersion": "DSTU2",
+  "id": "E-004",
+  "identifier": {"use": "event-id", "value": "E-004"},
+  "event": {"type": "ADT_A08"},
+  "subject": {
+    "identifier": {"value": "MRN-3003"},
+    "name": [{"family": ["Nguyen"]}]
+  },
+  "effectiveDateTime": "2015-03-10T07:30:00Z",
+  "notes": "legacy DSTU2 update"
+}

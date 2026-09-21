@@ -1,0 +1,4 @@
+{
+  "fhirVersion": "R4",
+  "id": "E-008",
+  "event": {"type": "OBS_RESULT", "sequence": 1

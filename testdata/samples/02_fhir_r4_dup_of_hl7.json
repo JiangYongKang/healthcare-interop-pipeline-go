@@ -1,0 +1,15 @@
+{
+  "fhirVersion": "R4",
+  "id": "E-001",
+  "identifier": {"use": "event-id", "system": "HOSP", "value": "E-001"},
+  "event": {"type": "ADT_A01", "sequence": 10},
+  "subject": {
+    "identifier": {"system": "HOSP", "value": "MRN-1001"},
+    "name": [{"family": "Chen", "given": ["Alice"]}],
+    "gender": "female",
+    "birthDate": "1984-05-06",
+    "telecom": [{"value": "555-1234"}]
+  },
+  "effectiveDateTime": "2026-09-01T08:00:00Z",
+  "notes": ""
+}

@@ -1,0 +1,15 @@
+{
+  "fhirVersion": "R4",
+  "id": "E-002",
+  "identifier": {"use": "event-id", "system": "HOSP", "value": "E-002"},
+  "event": {"type": "OBS_RESULT", "sequence": 20},
+  "subject": {
+    "identifier": {"system": "HOSP", "value": "MRN-2002"},
+    "name": [{"family": "Garcia", "given": ["Bob"]}],
+    "gender": "male",
+    "birthDate": "1977-11-23",
+    "telecom": [{"value": "555-0000"}]
+  },
+  "effectiveDateTime": "2026-09-02T10:15:00Z",
+  "notes": "CONFLICTING rewritten content same sequence"
+}
