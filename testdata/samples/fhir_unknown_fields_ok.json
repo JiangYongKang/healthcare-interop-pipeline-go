@@ -1,0 +1,9 @@
+{
+  "resourceType": "Observation",
+  "id": "EVT-1005",
+  "status": "final",
+  "subject": {"reference": "Patient/MRN-1002", "display": "Jane Roe"},
+  "code": {"coding": [{"code": "8867-4"}]},
+  "extension": [{"url": "http://example.local/confidential-note", "valueString": "private note Jane Roe"}],
+  "effectiveDateTime": "2026-09-06T10:00:00Z"
+}

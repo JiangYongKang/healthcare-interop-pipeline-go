@@ -1,0 +1,9 @@
+{
+  "resourceType": "Observation",
+  "id": "EVT-1004",
+  "status": "registered",
+  "subject": {"reference": "Patient/MRN-1001"},
+  "code": {"coding": [{"code": "29463-7"}]},
+  "valueQuantity": {"value": 80.4},
+  "effectiveDateTime": "2026-09-05T08:30:00Z"
+}

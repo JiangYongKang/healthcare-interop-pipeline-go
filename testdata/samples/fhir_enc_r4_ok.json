@@ -1,0 +1,8 @@
+{
+  "resourceType": "Encounter",
+  "id": "EVT-1003",
+  "status": "in-progress",
+  "subject": {"reference": "Patient/MRN-1003"},
+  "class": {"code": "AMB", "display": "ambulatory"},
+  "period": {"start": "2026-09-04T12:00:00Z"}
+}

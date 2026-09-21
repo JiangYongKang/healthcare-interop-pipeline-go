@@ -1,0 +1,12 @@
+{
+  "fhirVersion": "3.0",
+  "resource": {
+    "resourceType": "Condition",
+    "id": "EVT-1002",
+    "status": "inactive",
+    "subject": {"reference": "Patient/MRN-1001"},
+    "code": {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10", "code": "I10", "display": "Hypertension"}]},
+    "onsetDateTime": "2026-08-20",
+    "recordedDate": "2026-08-21T09:00:00Z"
+  }
+}

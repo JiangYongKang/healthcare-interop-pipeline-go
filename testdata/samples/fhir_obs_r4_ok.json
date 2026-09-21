@@ -1,0 +1,11 @@
+{
+  "resourceType": "Observation",
+  "id": "EVT-1001",
+  "meta": {"fhirVersion": "4.0"},
+  "status": "final",
+  "subject": {"reference": "Patient/MRN-1001"},
+  "code": {"coding": [{"system": "http://loinc.org", "code": "8310-5", "display": "Body temperature"}]},
+  "valueQuantity": {"value": 36.9, "unit": "Cel"},
+  "effectiveDateTime": "2026-09-01T11:00:00Z",
+  "note": "ambulatory measurement"
+}
