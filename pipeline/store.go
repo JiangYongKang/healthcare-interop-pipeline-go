@@ -510,18 +510,22 @@ func (s *fileStore) Submit(_ context.Context, rec *Record) (*Decision, error) {
 	outcome := OutcomeAccepted
 	var conflict *Conflict
 	if cur != nil {
-		switch cmp := compareCoords(rec, cur); {
-		case cmp > 0:
-			d.Reason = fmt.Sprintf("newer revision supersedes prior (ordinal=%d time=%s)",
-				versionOrdinal(cur.SourceVersion), effectiveOf(cur))
-		case cmp == 0:
-			// Same revision coordinates, different business content:
-			// never silently overwrite. Park for deterministic review.
+		cls := classifyRevision(rec, cur)
+		outcome = cls.outcome
+		d.Reason = cls.basis
+		if len(cls.fields) > 0 {
+			d.Reason += "; differing clinical fields: " + strings.Join(cls.fields, ",")
+		}
+
+		if outcome == OutcomeConflict {
+			// Genuinely disagreeing delivery (clinical content mismatch
+			// at the same clinical time, or a different patient): never
+			// silently overwrite. Apply the pending-backlog policy.
 			if s.cfg.MaxPendingReviews > 0 && s.model.pending >= s.cfg.MaxPendingReviews {
 				switch s.cfg.OverflowPolicy {
 				case OverflowReject:
 					d.Outcome = OutcomeRejected
-					d.Reason = fmt.Sprintf("pending review backlog limit %d reached; reject policy", s.cfg.MaxPendingReviews)
+					d.Reason = fmt.Sprintf("pending review backlog limit %d reached; reject policy (detained %s)", s.cfg.MaxPendingReviews, cls.reason)
 					d.ErrorType = string(ErrStorageConflict)
 					if err := s.appendDecision(d); err != nil {
 						return nil, err
@@ -529,7 +533,7 @@ func (s *fileStore) Submit(_ context.Context, rec *Record) (*Decision, error) {
 					return d, conflictErr(d, "pending review backlog limit reached")
 				case OverflowDegrade:
 					d.Outcome = OutcomeDegraded
-					d.Reason = fmt.Sprintf("pending review backlog limit %d reached; degraded journal", s.cfg.MaxPendingReviews)
+					d.Reason = fmt.Sprintf("pending review backlog limit %d reached; degraded journal (detained %s)", s.cfg.MaxPendingReviews, cls.reason)
 					if err := s.appendJSON(s.degFile, rec); err != nil {
 						return nil, err
 					}
@@ -539,28 +543,34 @@ func (s *fileStore) Submit(_ context.Context, rec *Record) (*Decision, error) {
 					return d, nil
 				}
 			}
-			outcome = OutcomeConflict
-			cid := conflictIDFor(rec.EventID, businessDigest(cur), digest)
+			cid := conflictIDForPair(rec.EventID, cur, rec)
 			d.ConflictID = cid
-			d.Reason = fmt.Sprintf("%s: identical revision coordinates (ordinal=%d time=%s) but different content; parked for review as %s; effective version retained",
-				ReasonContentConflict, versionOrdinal(rec.SourceVersion), effectiveOf(rec), cid)
 			if _, exists := s.model.conflicts[cid]; !exists {
 				conflict = &Conflict{
-					ConflictID:     cid,
-					ChainID:        chain.id,
-					EventID:        rec.EventID,
-					Reason:         ReasonContentConflict,
-					CurrentDigest:  businessDigest(cur),
-					IncomingDigest: digest,
-					Status:         ConflictPending,
-					DetectedSeq:    d.Seq,
+					ConflictID:      cid,
+					ChainID:         chain.id,
+					EventID:         rec.EventID,
+					Reason:          cls.reason,
+					CurrentDigest:   businessDigest(cur),
+					IncomingDigest:  digest,
+					DifferingFields: cls.fields,
+					Status:          ConflictPending,
+					DetectedSeq:     d.Seq,
+				}
+				if cls.reason == ReasonPatientMismatch {
+					conflict.CurrentPatient = cur.PatientRef
+					conflict.IncomingPatient = rec.PatientRef
 				}
 			}
-		default:
-			outcome = OutcomeOutOfOrder
-			d.Reason = fmt.Sprintf("stale revision (winner ordinal=%d time=%s vs incoming ordinal=%d time=%s); newer data retained",
-				versionOrdinal(cur.SourceVersion), effectiveOf(cur),
-				versionOrdinal(rec.SourceVersion), effectiveOf(rec))
+		} else if outcome == OutcomeDuplicate {
+			// Clinically identical redelivery in a different encoding at
+			// equal coordinates: no revision, no state change, journaled
+			// like an exact duplicate.
+			d.Outcome = OutcomeDuplicate
+			if err := s.appendDecision(d); err != nil {
+				return nil, err
+			}
+			return d, conflictErr(d, "clinically identical redelivery suppressed")
 		}
 	}
 

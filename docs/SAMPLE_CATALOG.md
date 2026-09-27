@@ -15,16 +15,22 @@
 | fhir_obs_r4_other.json | FHIR R4 Observation | 同患者 MRN-1001，验证纵向关联 |
 | fhir_unknown_fields_ok.json | FHIR R4 Observation | 未知 extension/display 必须被接受并令牌化 |
 
-| fhir_obs_r4_evt0001.json | FHIR R4 Observation | 与 hl7_obs_v23_ok 同一事件 EVT-0001（跨格式归链，R4 胜出） |
+| fhir_obs_r4_evt0001.json | FHIR R4 Observation | 与 hl7_obs_v23_ok 同一事件 EVT-0001：临床事实一致（同时间、同值 36.8，`cel`/`Cel` 与 LN/LOINC URL 归一等价），跨格式归链且 R4 正常取代 |
 
 ## 重复 / 乱序 / 冲突
 | 文件 | 预期 |
 |---|---|
 | hl7_dup_0001.hl7 | 与 hl7_obs_v23_ok 完全相同 → DUPLICATE |
 | fhir_dup_1001.json | 与 fhir_obs_r4_ok 完全相同 → DUPLICATE |
-| hl7_stale_0002.hl7 | 同 id 的 2.3/更早时间修订；新 2.5.1 已在位时 → OUT_OF_ORDER |
-| hl7_obs_v23_ok.hl7 | EVT-0001 的 FHIR R4 版本已在位（字典序先摄入）→ OUT_OF_ORDER |
-| hl7_zconflict_0004.hl7 | 与 hl7_enc_v251_ok 同版本同时间不同内容 → CONFLICT（待复核） |
+| hl7_stale_0002.hl7 | 同 id 的 2.3/更早临床时间修订；新 2.5.1 已在位时 → OUT_OF_ORDER |
+| hl7_obs_v23_ok.hl7 | EVT-0001 的 FHIR R4 已在位（字典序先摄入）：临床一致但版本序更旧 → OUT_OF_ORDER |
+| hl7_zconflict_0004.hl7 | 与 hl7_enc_v251_ok 同版本同临床时间、值不同（`{visit}` vs `{visit-corrected}`）→ CONFLICT / `CONTENT_CONFLICT_SAME_REVISION`（待复核，差异字段 value） |
+
+> 说明：跨格式/跨版本"内容确实不一致"（同临床时间但值、状态等对不上）以及"患者被换成
+> 另一个人"的场景没有放在样例语料中（以保持 9/2/2/1/13 的固定分布），由自动化用例
+> 稳定覆盖，见 README 第 10 节：
+> `CONTENT_CONFLICT_CROSS_REVISION`（两种到达顺序）与 `PATIENT_MISMATCH` 均断言
+> 原有效版本保留、链患者关联不改写、原因稳定可查、复核原子且幂等、重启与回放一致。
 
 ## 畸形 / 校验失败（拒绝原因可区分）
 | 文件 | 拒绝原因 | 对外类型 |

@@ -9,6 +9,92 @@ import (
 	"testing"
 )
 
+// Reprocessing history containing the new conflict families (cross-
+// revision content conflict and patient mismatch) plus reviews must
+// rebuild identical effective state, conflict reasons and statuses,
+// both via Replay() and across a full reopen, in both arrival orders.
+func TestReplayConsistentWithCrossRevisionAndPatientConflicts(t *testing.T) {
+	for _, highFirst := range []bool{false, true} {
+		name := "low-first"
+		if highFirst {
+			name = "high-first"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := testCfg(t, OverflowReject, 100)
+			st, _ := newFileStore(cfg)
+			ctx := context.Background()
+
+			// Cross-revision content disagreement at the same clinical
+			// time.
+			low := recFor("RX1", "2.3", "2026-09-01T10:15:00Z", "36.8")
+			high := recFor("RX1", "2.5.1", "2026-09-01T10:15:00Z", "40.0")
+			var d1 *Decision
+			if highFirst {
+				st.Submit(ctx, high)
+				d1, _ = st.Submit(ctx, low)
+			} else {
+				st.Submit(ctx, low)
+				d1, _ = st.Submit(ctx, high)
+			}
+			if d1.Outcome != OutcomeConflict {
+				t.Fatalf("%s: cross-revision disagreement must conflict: %s", name, d1.Outcome)
+			}
+			if _, err := st.Resolve(ctx, d1.ConflictID, AcceptIncoming, "rev"); err != nil {
+				t.Fatal(err)
+			}
+
+			// Patient mismatch stays pending (unresolved) across restart.
+			st.Submit(ctx, recForPatient("RX2", "PAT-A", "R4", "2026-09-02T00:00:00Z", "x"))
+			d2, _ := st.Submit(ctx, recForPatient("RX2", "PAT-B", "R4", "2026-09-02T00:00:00Z", "x"))
+			if d2.Outcome != OutcomeConflict {
+				t.Fatalf("%s: patient mismatch must conflict: %s", name, d2.Outcome)
+			}
+
+			rep, err := st.Replay(ctx)
+			if err != nil || !rep.Consistent {
+				t.Fatalf("%s: replay inconsistent: %+v err=%v", name, rep, err)
+			}
+			if rep.Conflicts != 2 || rep.PendingReviews != 1 {
+				t.Fatalf("%s: counts conflicts=%d pending=%d", name, rep.Conflicts, rep.PendingReviews)
+			}
+			live, _ := st.Snapshot(ctx)
+			st.Close()
+
+			cfg.ResetOutput = false
+			st2, err := newFileStore(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st2.Close()
+
+			replayed, _ := st2.Snapshot(ctx)
+			if len(replayed) != len(live) {
+				t.Fatalf("%s: snapshot lengths %d vs %d", name, len(live), len(replayed))
+			}
+			for i := range live {
+				if businessDigest(replayed[i]) != businessDigest(live[i]) {
+					t.Fatalf("%s: record %d diverged", name, i)
+				}
+			}
+			pend, _ := st2.PendingConflicts(ctx)
+			if len(pend) != 1 || pend[0].Reason != ReasonPatientMismatch || pend[0].ConflictID != d2.ConflictID {
+				t.Fatalf("%s: patient mismatch must survive reopen: %+v", name, pend)
+			}
+			chains, _ := st2.Chains(ctx)
+			for _, c := range chains {
+				if c.EventID == "RX1" && c.Status != ChainEffective {
+					t.Fatalf("%s: reviewed chain must be effective after reopen: %s", name, c.Status)
+				}
+			}
+			rep2, _ := st2.Replay(ctx)
+			if !rep2.Consistent {
+				t.Fatalf("%s: replay after reopen inconsistent: %+v", name, rep2)
+			}
+			t.Logf("messageId=RX1/RX2 basis=%s cross-revision+resolved and patient-mismatch+pending -> reopen equals live, replay consistent", name)
+		})
+	}
+}
+
 // Reprocessing the journal history must yield the same effective result
 // as incremental processing, across a mix of accepted, duplicate,
 // out-of-order, conflicted and resolved deliveries.

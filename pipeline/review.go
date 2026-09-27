@@ -11,11 +11,31 @@ import (
 type ConflictReason string
 
 const (
-	// ReasonContentConflict: two deliveries carry the same revision
-	// coordinates (format-version ordinal + effective time) but
-	// different business content. Never resolved silently.
-	ReasonContentConflict ConflictReason = "CONTENT_CONFLICT_SAME_REVISION"
+	// ReasonContentConflictSameRevision: two deliveries carry the same
+	// revision coordinates (format-version ordinal + clinical effective
+	// time) but different clinical content. Never resolved silently.
+	ReasonContentConflictSameRevision ConflictReason = "CONTENT_CONFLICT_SAME_REVISION"
+	// ReasonContentConflictCrossRevision: two deliveries of one event at
+	// the same clinical effective time but different format/version
+	// coordinates carry genuinely different clinical content (value,
+	// status, code, ...). The newer/higher-priority delivery must NOT
+	// silently overwrite the effective version; both orders park for
+	// review. Distinct from ReasonContentConflictSameRevision so reviewers
+	// can tell same-revision disagreements from cross-version ones.
+	ReasonContentConflictCrossRevision ConflictReason = "CONTENT_CONFLICT_CROSS_REVISION"
+	// ReasonPatientMismatch: a delivery in an existing event chain names
+	// a different patient than the chain's current effective version
+	// (patient identifier swapped for another person). The chain's
+	// patient association must never be rewritten by such a delivery; it
+	// is parked for review and the effective version (with its patient
+	// link) is retained. Distinct from the content-conflict reasons.
+	ReasonPatientMismatch ConflictReason = "PATIENT_MISMATCH"
 )
+
+// ReasonContentConflict is retained as an alias for the same-revision
+// content-conflict reason (callers and older journals use the short
+// name).
+const ReasonContentConflict = ReasonContentConflictSameRevision
 
 // ConflictStatus is the lifecycle state of a detected conflict.
 type ConflictStatus string
@@ -44,7 +64,7 @@ type Resolution struct {
 	Seq          int64            `json:"seq"`
 }
 
-// Conflict is one detected content inconsistency inside an event chain.
+// Conflict is one detected inconsistency inside an event chain.
 // Digests (not raw content) identify the disagreeing revisions, so the
 // review flow never exposes sensitive values beyond the de-identified
 // record view.
@@ -55,15 +75,27 @@ type Conflict struct {
 	Reason         ConflictReason `json:"reason"`
 	CurrentDigest  string         `json:"currentDigest"`
 	IncomingDigest string         `json:"incomingDigest"`
-	Status         ConflictStatus `json:"status"`
-	Resolution     *Resolution    `json:"resolution,omitempty"`
-	DetectedSeq    int64          `json:"detectedSeq"`
+	// DifferingFields lists the disagreeing clinical fact fields for
+	// content conflicts (value/status/code/...); empty for patient
+	// mismatch (the disagreement is the patient itself).
+	DifferingFields []string `json:"differingFields,omitempty"`
+	// CurrentPatient / IncomingPatient carry de-identified pseudonyms
+	// for PATIENT_MISMATCH conflicts, empty otherwise.
+	CurrentPatient  string         `json:"currentPatient,omitempty"`
+	IncomingPatient string         `json:"incomingPatient,omitempty"`
+	Status          ConflictStatus `json:"status"`
+	Resolution      *Resolution    `json:"resolution,omitempty"`
+	DetectedSeq     int64          `json:"detectedSeq"`
 }
 
-// conflictIDFor builds a deterministic conflict identifier: the same
-// pair of disagreeing revisions always yields the same id, so repeat
-// detection never creates duplicate conflict records.
-func conflictIDFor(eventID, digestA, digestB string) string {
+// conflictIDForPair builds a deterministic, arrival-order-independent
+// conflict identifier from the unordered pair of the two disagreeing
+// revisions' business digests: the same two deliveries always yield the
+// same id no matter which one arrived first (and is currently
+// effective). Repeat detection therefore never creates duplicate
+// conflict records.
+func conflictIDForPair(eventID string, a, b *Record) string {
+	digestA, digestB := businessDigest(a), businessDigest(b)
 	if digestA > digestB {
 		digestA, digestB = digestB, digestA
 	}

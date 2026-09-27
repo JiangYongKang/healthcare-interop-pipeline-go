@@ -103,6 +103,30 @@ func compareModels(live, rebuilt *chainModel) *ReplayReport {
 		if rc.Status != lc.Status {
 			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("conflict %s status live=%s replay=%s", cid, lc.Status, rc.Status))
 		}
+		if rc.Reason != lc.Reason {
+			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("conflict %s reason live=%s replay=%s", cid, lc.Reason, rc.Reason))
+		}
+		if rc.CurrentDigest != lc.CurrentDigest || rc.IncomingDigest != lc.IncomingDigest {
+			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("conflict %s digests live=(%s,%s) replay=(%s,%s)",
+				cid, shortDigest(lc.CurrentDigest), shortDigest(lc.IncomingDigest),
+				shortDigest(rc.CurrentDigest), shortDigest(rc.IncomingDigest)))
+		}
+		if fmt.Sprint(rc.DifferingFields) != fmt.Sprint(lc.DifferingFields) {
+			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("conflict %s differing fields live=%v replay=%v",
+				cid, lc.DifferingFields, rc.DifferingFields))
+		}
+		switch {
+		case lc.Resolution == nil && rc.Resolution != nil:
+			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("conflict %s resolution missing live", cid))
+		case lc.Resolution != nil && rc.Resolution == nil:
+			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("conflict %s resolution missing replay", cid))
+		case lc.Resolution != nil && rc.Resolution != nil:
+			if lc.Resolution.Choice != rc.Resolution.Choice || lc.Resolution.WinnerDigest != rc.Resolution.WinnerDigest {
+				rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("conflict %s resolution live=(%s,%s) replay=(%s,%s)",
+					cid, lc.Resolution.Choice, shortDigest(lc.Resolution.WinnerDigest),
+					rc.Resolution.Choice, shortDigest(rc.Resolution.WinnerDigest)))
+			}
+		}
 	}
 	for cid := range rebuilt.conflicts {
 		if live.conflicts[cid] == nil {

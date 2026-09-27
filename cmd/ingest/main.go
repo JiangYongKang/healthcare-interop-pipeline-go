@@ -103,8 +103,8 @@ func run() error {
 		return err
 	}
 	for _, c := range pending {
-		fmt.Printf("[pending-review] %s eventId=%s reason=%s current=%s incoming=%s\n",
-			c.ConflictID, c.EventID, c.Reason, short(c.CurrentDigest), short(c.IncomingDigest))
+		fmt.Printf("[pending-review] %s eventId=%s reason=%s current=%s incoming=%s fields=%v\n",
+			c.ConflictID, c.EventID, c.Reason, short(c.CurrentDigest), short(c.IncomingDigest), c.DifferingFields)
 	}
 	return nil
 }
