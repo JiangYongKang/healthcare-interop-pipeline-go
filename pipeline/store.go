@@ -25,18 +25,26 @@ const (
 	OutcomeDuplicate  Outcome = "DUPLICATE"
 	OutcomeOutOfOrder Outcome = "OUT_OF_ORDER"
 	OutcomeDegraded   Outcome = "DEGRADED"
+	// OutcomeConflict: the delivery conflicts with the current effective
+	// version on identical revision coordinates; it is retained for
+	// audit and parked for review. The effective version is unchanged.
+	OutcomeConflict Outcome = "CONFLICT"
+	// OutcomeReviewApplied: a review conclusion was applied to a chain.
+	OutcomeReviewApplied Outcome = "REVIEW_APPLIED"
 )
 
 // Decision is one traceable entry in the pipeline journals.
 type Decision struct {
-	Seq       int64   `json:"seq"`
-	EventID   string  `json:"eventId"`
-	Outcome   Outcome `json:"outcome"`
-	Reason    string  `json:"reason,omitempty"`
-	ErrorType string  `json:"errorType,omitempty"`
-	Detail    string  `json:"detail,omitempty"`
-	Format    string  `json:"format,omitempty"`
-	Version   string  `json:"version,omitempty"`
+	Seq        int64   `json:"seq"`
+	EventID    string  `json:"eventId"`
+	Outcome    Outcome `json:"outcome"`
+	Reason     string  `json:"reason,omitempty"`
+	ErrorType  string  `json:"errorType,omitempty"`
+	Detail     string  `json:"detail,omitempty"`
+	Format     string  `json:"format,omitempty"`
+	Version    string  `json:"version,omitempty"`
+	ChainID    string  `json:"chainId,omitempty"`
+	ConflictID string  `json:"conflictId,omitempty"`
 }
 
 // Store is the concurrency-safe persistence boundary.
@@ -52,6 +60,18 @@ type Store interface {
 	Snapshot(ctx context.Context) ([]*Record, error)
 	// Decisions returns the append-only decision journal.
 	Decisions(ctx context.Context) ([]*Decision, error)
+	// Chains returns the event consistency view: one chain per clinical
+	// event with all deliveries and the current effective version.
+	Chains(ctx context.Context) ([]*ChainView, error)
+	// PendingConflicts lists conflicts awaiting review.
+	PendingConflicts(ctx context.Context) ([]*Conflict, error)
+	// Resolve applies a review conclusion to a conflict. Applying the
+	// same conclusion repeatedly is idempotent.
+	Resolve(ctx context.Context, conflictID string, choice ResolutionChoice, reviewer string) (*ReviewResult, error)
+	// Replay rebuilds chain state from the journals and verifies it
+	// matches the live state, proving history reprocessing equals
+	// incremental processing.
+	Replay(ctx context.Context) (*ReplayReport, error)
 	// Close fsyncs and releases all file handles.
 	Close() error
 }
@@ -60,7 +80,13 @@ const (
 	revisionsFile = "revisions.jsonl"
 	decisionsFile = "decisions.jsonl"
 	degradedFile  = "degraded.jsonl"
+	conflictsFile = "conflicts.jsonl"
+	reviewsFile   = "reviews.jsonl"
+	replayFile    = "replay.jsonl"
 )
+
+// journalFiles lists every append-only journal, for reset and close.
+var journalFiles = []string{revisionsFile, decisionsFile, degradedFile, conflictsFile, reviewsFile, replayFile}
 
 // fileStore persists to JSONL files under a directory. All mutating
 // decisions are serialized by mu, so de-identified data, idempotence
@@ -73,13 +99,14 @@ type fileStore struct {
 	revFile *os.File
 	decFile *os.File
 	degFile *os.File
+	conFile *os.File
+	rvwFile *os.File
+	rplFile *os.File
 
-	seq      int64 // monotonic arrival sequence (journal only)
-	byEvent  map[string]*Record
-	revision map[string]string          // eventID -> effective time of current winner
-	digests  map[string]map[string]bool // eventID -> all persisted content digests
-	accepted int                        // distinct events currently won
-	closed   bool
+	seq       int64 // monotonic arrival sequence (journals only)
+	model     *chainModel
+	replaySem chan struct{}
+	closed    bool
 }
 
 func newFileStore(cfg Config) (Store, error) {
@@ -90,13 +117,15 @@ func newFileStore(cfg Config) (Store, error) {
 		return nil, &IngestionError{Type: ErrUnavailable, Message: "cannot create output directory", Reason: "IO_ERROR", Detail: err.Error()}
 	}
 	s := &fileStore{
-		dir:     cfg.OutputDir,
-		cfg:     cfg,
-		byEvent: map[string]*Record{},
-		digests: map[string]map[string]bool{},
+		dir:   cfg.OutputDir,
+		cfg:   cfg,
+		model: newChainModel(),
+	}
+	if cfg.MaxReplayTasks > 0 {
+		s.replaySem = make(chan struct{}, cfg.MaxReplayTasks)
 	}
 	if cfg.ResetOutput {
-		for _, f := range []string{revisionsFile, decisionsFile, degradedFile} {
+		for _, f := range journalFiles {
 			if err := os.Remove(filepath.Join(cfg.OutputDir, f)); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return nil, err
 			}
@@ -112,14 +141,21 @@ func newFileStore(cfg Config) (Store, error) {
 func (s *fileStore) openAndReplay() error {
 	var err error
 	// Open all files first; if any open fails no file was truncated.
-	if s.revFile, err = os.OpenFile(filepath.Join(s.dir, revisionsFile), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644); err != nil {
-		return ioErr(err)
+	handles := []struct {
+		name string
+		dst  **os.File
+	}{
+		{revisionsFile, &s.revFile},
+		{decisionsFile, &s.decFile},
+		{degradedFile, &s.degFile},
+		{conflictsFile, &s.conFile},
+		{reviewsFile, &s.rvwFile},
+		{replayFile, &s.rplFile},
 	}
-	if s.decFile, err = os.OpenFile(filepath.Join(s.dir, decisionsFile), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644); err != nil {
-		return ioErr(err)
-	}
-	if s.degFile, err = os.OpenFile(filepath.Join(s.dir, degradedFile), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644); err != nil {
-		return ioErr(err)
+	for _, h := range handles {
+		if *h.dst, err = os.OpenFile(filepath.Join(s.dir, h.name), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644); err != nil {
+			return ioErr(err)
+		}
 	}
 	if err := s.replay(); err != nil {
 		return err
@@ -131,142 +167,244 @@ func ioErr(err error) error {
 	return &IngestionError{Type: ErrUnavailable, Message: "persistence failure", Reason: "IO_ERROR", Detail: err.Error()}
 }
 
-type revEntry struct {
-	rec    *Record
-	raw    string
-	ok     bool
-	endOff int64
+// committingOutcome reports whether a decision outcome commits one
+// appended revision (as opposed to duplicate/reject/degrade decisions,
+// which append no revision, and review decisions, which are
+// informational: the reviews journal is their commit record).
+func committingOutcome(o Outcome) bool {
+	return o == OutcomeAccepted || o == OutcomeOutOfOrder || o == OutcomeConflict
 }
 
-// replay rebuilds in-memory indexes from the append-only journals and
-// heals any torn trailing line left by a killed process. Revision and
-// decision journals are healed independently; in-memory state reflects
-// only prefixes that are complete on both journals.
+// replayAction is one ordered history event: a committed revision or a
+// committed review conclusion.
+type replayAction struct {
+	seq int64
+	rev *Record
+	dec *Decision // paired committing decision, when rev != nil
+	rw  *reviewEntry
+}
+
+// replay rebuilds the in-memory chain model from the append-only
+// journals and heals torn or crash-orphan tails. Revisions are paired
+// with their committing decisions per event in order; reviews are
+// merged by sequence so the reprocessed history interleaves exactly as
+// it happened live, yielding the same effective state.
 func (s *fileStore) replay() error {
-	var revs []revEntry
-	var revOff int64
-	if err := readJSONLLines(s.revFile, func(line string) {
-		var r Record
-		revOff += int64(len(line) + 1)
-		if json.Unmarshal([]byte(line), &r) == nil && r.EventID != "" {
-			revs = append(revs, revEntry{&r, line, true, revOff})
-		} else {
-			revs = append(revs, revEntry{nil, line, false, revOff})
-		}
-	}); err != nil {
-		return err
-	}
-	var decisions []*Decision
-	if err := readJSONLLines(s.decFile, func(line string) {
-		var d Decision
-		if json.Unmarshal([]byte(line), &d) == nil && d.EventID != "" {
-			decisions = append(decisions, &d)
-		} else {
-			decisions = append(decisions, nil)
-		}
-	}); err != nil {
+	j, err := s.readJournals()
+	if err != nil {
 		return err
 	}
 
-	// First torn/invalid line terminates replay for that journal.
-	goodRevs := 0
-	for _, rl := range revs {
-		if !rl.ok {
-			break
-		}
-		goodRevs++
-	}
-	goodDecs := len(decisions)
-	for i, d := range decisions {
-		if d == nil {
-			goodDecs = i
-			break
-		}
-	}
-
-	// Decisions mark which revisions were committed. A revision appended
-	// just before a crash (with no decision) is an orphan and is removed
-	// by truncation, so no partial state can survive a failed write.
-	committed := map[string]bool{}
-	for _, d := range decisions[:goodDecs] {
-		if s.seq < d.Seq {
+	// Rebuild the model from ordered history: committed revisions paired
+	// with their decisions, reviews merged by sequence.
+	for _, d := range j.decisions {
+		if d.Seq > s.seq {
 			s.seq = d.Seq
 		}
-		if d.Outcome == OutcomeAccepted || d.Outcome == OutcomeOutOfOrder {
-			committed[d.EventID] = true
+	}
+	for _, rw := range j.reviews {
+		if rw.Seq > s.seq {
+			s.seq = rw.Seq
 		}
 	}
-	var lastCommittedOff int64
-	for i := 0; i < goodRevs; i++ {
-		r := revs[i].rec
-		if !committed[r.EventID] {
+	actions, lastCommittedRevOff := buildReplayActions(j)
+	applyReplayActions(s.model, actions)
+
+	// Heal torn tails and crash orphans so no half-written state
+	// survives a restart.
+	if err := truncateFile(s.revFile, lastCommittedRevOff, j.revSize); err != nil {
+		return err
+	}
+	if err := truncateFile(s.decFile, j.decGood, j.decSize); err != nil {
+		return err
+	}
+	// Conflict lines are journaled in detection order, one per CONFLICT
+	// decision; lines beyond the committed count are crash orphans.
+	committedConflicts := int64(0)
+	for _, d := range j.decisions {
+		if d.Outcome == OutcomeConflict {
+			committedConflicts++
+		}
+	}
+	if err := truncateFile(s.conFile, prefixOffset(j.conOffsets, committedConflicts), j.conSize); err != nil {
+		return err
+	}
+	if err := truncateFile(s.rvwFile, j.rvwGood, j.rvwSize); err != nil {
+		return err
+	}
+	return truncateFile(s.rplFile, j.rplGood, j.rplSize)
+}
+
+// truncateFile shortens f to length when it is longer (torn/orphan
+// tail) and restores the append offset.
+func truncateFile(f *os.File, length, size int64) error {
+	if length < size {
+		if err := f.Truncate(length); err != nil {
+			return ioErr(err)
+		}
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		return ioErr(err)
+	}
+	return nil
+}
+
+// prefixOffset returns the end offset of the first n lines; fewer lines
+// available means the file is already shorter (torn), keep its good end.
+func prefixOffset(offsets []int64, n int64) int64 {
+	if n <= 0 {
+		return 0
+	}
+	if int(n) > len(offsets) {
+		return offsets[len(offsets)-1]
+	}
+	return offsets[n-1]
+}
+
+// journalData holds the good prefixes of every journal plus the offsets
+// needed for healing.
+type journalData struct {
+	revisions  []*Record
+	revOffsets []int64 // end offset of each good revision line
+	revSize    int64
+	decisions  []*Decision
+	decGood    int64 // end offset of good decision prefix
+	decSize    int64
+	reviews    []*reviewEntry
+	rvwGood    int64
+	rvwSize    int64
+	conOffsets []int64 // end offsets of parseable conflict lines
+	conSize    int64
+	rplGood    int64
+	rplSize    int64
+}
+
+// readJournals scans all journals and returns their valid prefixes.
+// The first torn/invalid line terminates the scan of that journal.
+func (s *fileStore) readJournals() (*journalData, error) {
+	j := &journalData{}
+	var off int64
+
+	// Revisions: valid = parses and carries an event id.
+	err := scanLines(s.revFile, func(line string, end int64) bool {
+		var r Record
+		if json.Unmarshal([]byte(line), &r) != nil || r.EventID == "" {
+			return false
+		}
+		j.revisions = append(j.revisions, &r)
+		j.revOffsets = append(j.revOffsets, end)
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if j.revSize, err = fileSize(s.revFile); err != nil {
+		return nil, err
+	}
+
+	// Decisions.
+	err = scanLines(s.decFile, func(line string, end int64) bool {
+		var d Decision
+		if json.Unmarshal([]byte(line), &d) != nil || d.EventID == "" {
+			return false
+		}
+		j.decisions = append(j.decisions, &d)
+		j.decGood = end
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if j.decSize, err = fileSize(s.decFile); err != nil {
+		return nil, err
+	}
+
+	// Reviews: every complete line is a committed conclusion.
+	err = scanLines(s.rvwFile, func(line string, end int64) bool {
+		var rw reviewEntry
+		if json.Unmarshal([]byte(line), &rw) != nil || rw.ConflictID == "" {
+			return false
+		}
+		j.reviews = append(j.reviews, &rw)
+		j.rvwGood = end
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if j.rvwSize, err = fileSize(s.rvwFile); err != nil {
+		return nil, err
+	}
+
+	// Conflicts (audit log; state is re-derived from revisions +
+	// decisions, offsets only serve orphan truncation).
+	err = scanLines(s.conFile, func(line string, end int64) bool {
+		var c Conflict
+		if json.Unmarshal([]byte(line), &c) != nil || c.ConflictID == "" {
+			return false
+		}
+		j.conOffsets = append(j.conOffsets, end)
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if j.conSize, err = fileSize(s.conFile); err != nil {
+		return nil, err
+	}
+
+	// Replay audit log: heal torn tail only.
+	off = 0
+	err = scanLines(s.rplFile, func(line string, end int64) bool {
+		var rp ReplayReport
+		if json.Unmarshal([]byte(line), &rp) != nil {
+			return false
+		}
+		j.rplGood = end
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if j.rplSize, err = fileSize(s.rplFile); err != nil {
+		return nil, err
+	}
+	_ = off
+	return j, nil
+}
+
+func fileSize(f *os.File) (int64, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, ioErr(err)
+	}
+	return fi.Size(), nil
+}
+
+// scanLines emits each non-empty line with its end offset until emit
+// returns false (invalid line: terminates the valid prefix).
+func scanLines(f *os.File, emit func(line string, end int64) bool) error {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return ioErr(err)
+	}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	var off int64
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		off += int64(len(sc.Bytes())) + 1
+		if line == "" {
 			continue
 		}
-		if cur, exists := s.byEvent[r.EventID]; !exists || recNewer(r, cur) {
-			s.byEvent[r.EventID] = r
-		}
-		if s.digests[r.EventID] == nil {
-			s.digests[r.EventID] = map[string]bool{}
-		}
-		s.digests[r.EventID][businessDigest(r)] = true
-		lastCommittedOff = revs[i].endOff
-	}
-	s.accepted = len(s.byEvent)
-
-	// Heal torn trailing lines and crash-orphan revisions by truncating
-	// both journals back to their last committed prefixes.
-	if goodRevs < len(revs) || lastCommittedOff < revOff {
-		if err := s.truncateToValid(lastCommittedOff); err != nil {
-			return err
+		if !emit(line, off) {
+			break
 		}
 	}
-	if goodDecs < len(decisions) {
-		if err := s.truncateDecToValid(decisions, goodDecs); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *fileStore) truncateToValid(length int64) error {
-	if err := s.revFile.Truncate(length); err != nil {
+	if err := sc.Err(); err != nil {
 		return ioErr(err)
 	}
-	if _, err := s.revFile.Seek(0, io.SeekEnd); err != nil {
-		return ioErr(err)
-	}
-	return nil
-}
-
-func (s *fileStore) truncateDecToValid(decs []*Decision, good int) error {
-	var n int64
-	for i := 0; i < good; i++ {
-		b, _ := json.Marshal(decs[i])
-		n += int64(len(b)) + 1
-	}
-	if err := s.decFile.Truncate(n); err != nil {
-		return ioErr(err)
-	}
-	if _, err := s.decFile.Seek(0, io.SeekEnd); err != nil {
-		return ioErr(err)
-	}
-	return nil
-}
-
-// recNewer reports whether incoming revision r supersedes current c.
-// Ordering rule (fully deterministic, independent of arrival order):
-// version ordinal, then effective/event time, then content digest.
-// A never-newer record must not silently overwrite newer data.
-func recNewer(r, c *Record) bool {
-	rv, cv := versionOrdinal(r.SourceVersion), versionOrdinal(c.SourceVersion)
-	if rv != cv {
-		return rv > cv
-	}
-	rt, ct := effectiveOf(r), effectiveOf(c)
-	if rt != ct {
-		return rt > ct
-	}
-	return businessDigest(r) > businessDigest(c)
+	_, err := f.Seek(0, io.SeekEnd)
+	return err
 }
 
 func effectiveOf(r *Record) string {
@@ -323,13 +461,15 @@ func (s *fileStore) Submit(_ context.Context, rec *Record) (*Decision, error) {
 		return nil, &IngestionError{Type: ErrUnavailable, Message: "store closed", Reason: "CLOSED"}
 	}
 	s.seq++
-	_, exists := s.byEvent[rec.EventID]
-	d := &Decision{Seq: s.seq, EventID: rec.EventID, Format: rec.SourceFormat, Version: rec.SourceVersion}
+	d := &Decision{
+		Seq: s.seq, EventID: rec.EventID, Format: rec.SourceFormat,
+		Version: rec.SourceVersion, ChainID: chainIDFor(rec.EventID),
+	}
 	digest := businessDigest(rec)
 
 	// Exact redelivery of any previously persisted revision is a
 	// duplicate regardless of which revision currently wins.
-	if s.digests[rec.EventID][digest] {
+	if s.model.digests[rec.EventID][digest] {
 		d.Outcome = OutcomeDuplicate
 		d.Reason = "identical redelivery; no new record created"
 		if err := s.appendDecision(d); err != nil {
@@ -341,7 +481,8 @@ func (s *fileStore) Submit(_ context.Context, rec *Record) (*Decision, error) {
 	// Capacity applies only when this is the first revision of a new
 	// event; repeated/out-of-order revisions of known events never
 	// displace the configured limit.
-	if !exists && s.cfg.MaxRecords > 0 && s.accepted >= s.cfg.MaxRecords {
+	_, known := s.model.chains[rec.EventID]
+	if !known && s.cfg.MaxRecords > 0 && s.model.accepted >= s.cfg.MaxRecords {
 		switch s.cfg.OverflowPolicy {
 		case OverflowReject:
 			d.Outcome = OutcomeRejected
@@ -364,41 +505,86 @@ func (s *fileStore) Submit(_ context.Context, rec *Record) (*Decision, error) {
 		}
 	}
 
-	// Every non-duplicate revision is durably retained (append-only) so
-	// the decision is fully traceable. Outcome vs. the *currently winning*
-	// revision follows the deterministic rule and is independent of
-	// arrival order: late old data is marked, never silently applied.
-	winner := rec
+	chain := s.model.chainFor(rec.EventID)
+	cur := chain.effective
 	outcome := OutcomeAccepted
-	if cur, curExists := s.byEvent[rec.EventID]; curExists {
-		if recNewer(rec, cur) {
+	var conflict *Conflict
+	if cur != nil {
+		switch cmp := compareCoords(rec, cur); {
+		case cmp > 0:
 			d.Reason = fmt.Sprintf("newer revision supersedes prior (ordinal=%d time=%s)",
 				versionOrdinal(cur.SourceVersion), effectiveOf(cur))
-		} else {
+		case cmp == 0:
+			// Same revision coordinates, different business content:
+			// never silently overwrite. Park for deterministic review.
+			if s.cfg.MaxPendingReviews > 0 && s.model.pending >= s.cfg.MaxPendingReviews {
+				switch s.cfg.OverflowPolicy {
+				case OverflowReject:
+					d.Outcome = OutcomeRejected
+					d.Reason = fmt.Sprintf("pending review backlog limit %d reached; reject policy", s.cfg.MaxPendingReviews)
+					d.ErrorType = string(ErrStorageConflict)
+					if err := s.appendDecision(d); err != nil {
+						return nil, err
+					}
+					return d, conflictErr(d, "pending review backlog limit reached")
+				case OverflowDegrade:
+					d.Outcome = OutcomeDegraded
+					d.Reason = fmt.Sprintf("pending review backlog limit %d reached; degraded journal", s.cfg.MaxPendingReviews)
+					if err := s.appendJSON(s.degFile, rec); err != nil {
+						return nil, err
+					}
+					if err := s.appendDecision(d); err != nil {
+						return nil, err
+					}
+					return d, nil
+				}
+			}
+			outcome = OutcomeConflict
+			cid := conflictIDFor(rec.EventID, businessDigest(cur), digest)
+			d.ConflictID = cid
+			d.Reason = fmt.Sprintf("%s: identical revision coordinates (ordinal=%d time=%s) but different content; parked for review as %s; effective version retained",
+				ReasonContentConflict, versionOrdinal(rec.SourceVersion), effectiveOf(rec), cid)
+			if _, exists := s.model.conflicts[cid]; !exists {
+				conflict = &Conflict{
+					ConflictID:     cid,
+					ChainID:        chain.id,
+					EventID:        rec.EventID,
+					Reason:         ReasonContentConflict,
+					CurrentDigest:  businessDigest(cur),
+					IncomingDigest: digest,
+					Status:         ConflictPending,
+					DetectedSeq:    d.Seq,
+				}
+			}
+		default:
 			outcome = OutcomeOutOfOrder
-			winner = cur
 			d.Reason = fmt.Sprintf("stale revision (winner ordinal=%d time=%s vs incoming ordinal=%d time=%s); newer data retained",
 				versionOrdinal(cur.SourceVersion), effectiveOf(cur),
 				versionOrdinal(rec.SourceVersion), effectiveOf(rec))
 		}
 	}
+
+	// Commit order: revision, then conflict detection, then decision.
+	// The decision is the commit record; a crash before it leaves an
+	// orphan that replay truncates, so no half-applied state survives.
 	if err := s.appendJSON(s.revFile, rec); err != nil {
 		return nil, err
 	}
-	if s.digests[rec.EventID] == nil {
-		s.digests[rec.EventID] = map[string]bool{}
+	if conflict != nil {
+		if err := s.appendJSON(s.conFile, conflict); err != nil {
+			return nil, err
+		}
 	}
-	s.digests[rec.EventID][digest] = true
-	s.byEvent[rec.EventID] = winner
-	if !exists {
-		s.accepted++
-	}
+	s.model.applyCommitted(rec, d.Seq, outcome, d.Reason)
 	d.Outcome = outcome
 	if err := s.appendDecision(d); err != nil {
 		return nil, err
 	}
-	if outcome == OutcomeOutOfOrder {
+	switch outcome {
+	case OutcomeOutOfOrder:
 		return d, conflictErr(d, "out-of-order message retained as stale revision")
+	case OutcomeConflict:
+		return d, conflictErr(d, "content conflict parked for review; effective version retained")
 	}
 	return d, nil
 }
@@ -445,17 +631,7 @@ func (s *fileStore) appendDecision(d *Decision) error {
 func (s *fileStore) Snapshot(_ context.Context) ([]*Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]*Record, 0, len(s.byEvent))
-	for _, r := range s.byEvent {
-		out = append(out, cloneRecord(r))
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].EventTime != out[j].EventTime {
-			return out[i].EventTime < out[j].EventTime
-		}
-		return out[i].EventID < out[j].EventID
-	})
-	return out, nil
+	return s.model.snapshot(), nil
 }
 
 func cloneRecord(r *Record) *Record {
@@ -494,6 +670,18 @@ func (s *fileStore) Decisions(_ context.Context) ([]*Decision, error) {
 	return out, sc.Err()
 }
 
+func (s *fileStore) Chains(_ context.Context) ([]*ChainView, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.model.chainViews(), nil
+}
+
+func (s *fileStore) PendingConflicts(_ context.Context) ([]*Conflict, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.model.pendingConflicts(), nil
+}
+
 func (s *fileStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -506,7 +694,7 @@ func (s *fileStore) Close() error {
 
 func (s *fileStore) closeHandles() error {
 	var errs []string
-	for _, f := range []*os.File{s.revFile, s.decFile, s.degFile} {
+	for _, f := range []*os.File{s.revFile, s.decFile, s.degFile, s.conFile, s.rvwFile, s.rplFile} {
 		if f == nil {
 			continue
 		}
@@ -521,21 +709,4 @@ func (s *fileStore) closeHandles() error {
 		return ioErr(errors.New(strings.Join(errs, "; ")))
 	}
 	return nil
-}
-
-// readJSONLLines reads whole lines from an O_APPEND file from offset 0,
-// restoring the append offset afterwards.
-func readJSONLLines(f *os.File, emit func(string)) error {
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return ioErr(err)
-	}
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		if line := strings.TrimSpace(sc.Text()); line != "" {
-			emit(line)
-		}
-	}
-	_, _ = f.Seek(0, io.SeekEnd)
-	return sc.Err()
 }

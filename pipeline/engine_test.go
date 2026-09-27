@@ -166,15 +166,38 @@ func TestEngineMixedSampleDirectory(t *testing.T) {
 	}
 	// Sorted input + ordered commits makes every label reproducible.
 	if counts[OutcomeAccepted] != 9 || counts[OutcomeDuplicate] != 2 ||
-		counts[OutcomeOutOfOrder] != 1 || counts[OutcomeRejected] != 13 {
+		counts[OutcomeOutOfOrder] != 2 || counts[OutcomeConflict] != 1 ||
+		counts[OutcomeRejected] != 13 {
 		t.Fatalf("unexpected distribution over samples: %v", counts)
 	}
 	recs, _ := eng.Snapshot(ctx)
 	if len(recs) != 9 {
 		t.Fatalf("final distinct records must be 9, got %d", len(recs))
 	}
-	t.Logf("basis=concurrent parse with ordered commits over samples (n=%d): %v; final records=%d",
-		len(results), counts, len(recs))
+	// Consistency view: one chain per distinct event; the cross-format
+	// EVT-0001 chain groups its HL7 and FHIR deliveries; the EVT-0004
+	// conflict is parked for review.
+	chains, err := eng.Chains(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chains) != 9 {
+		t.Fatalf("expected 9 event chains, got %d", len(chains))
+	}
+	c1 := findChain(chains, "EVT-0001")
+	if c1 == nil || len(c1.Deliveries) != 2 || c1.Effective == nil || c1.Effective.SourceFormat != "FHIR-JSON" {
+		t.Fatalf("cross-format chain EVT-0001 wrong: %+v", c1)
+	}
+	c4 := findChain(chains, "EVT-0004")
+	if c4 == nil || c4.Status != ChainPendingReview || c4.PendingConflicts != 1 {
+		t.Fatalf("conflict chain EVT-0004 must be pending review: %+v", c4)
+	}
+	rep, err := eng.Replay(ctx)
+	if err != nil || !rep.Consistent {
+		t.Fatalf("replay over samples must be consistent: %+v err=%v", rep, err)
+	}
+	t.Logf("basis=concurrent parse with ordered commits over samples (n=%d): %v; final records=%d chains=%d replay=consistent",
+		len(results), counts, len(recs), len(chains))
 }
 
 func TestEngineOutOfOrderMarkedSequentially(t *testing.T) {

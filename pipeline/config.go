@@ -28,17 +28,27 @@ type Config struct {
 	// ResetOutput clears prior output at Open. When false, the store
 	// replays its journals, guaranteeing idempotence across restarts.
 	ResetOutput bool
+	// MaxPendingReviews caps conflicts awaiting review. 0 means
+	// unlimited. Overflow follows OverflowPolicy (reject the delivery
+	// or degrade it to the degraded journal); either way the backlog
+	// stays queryable and no half-applied state is left behind.
+	MaxPendingReviews int
+	// MaxReplayTasks caps concurrently running consistency replays.
+	// 0 means unlimited; excess requests are refused with UNAVAILABLE.
+	MaxReplayTasks int
 }
 
 // DefaultConfig returns conservative local defaults.
 func DefaultConfig() Config {
 	return Config{
-		OutputDir:      "output",
-		MaxRecords:     10000,
-		MaxInFlight:    32,
-		OverflowPolicy: OverflowReject,
-		DeIDSalt:       "local-dev-salt-v1",
-		ResetOutput:    false,
+		OutputDir:         "output",
+		MaxRecords:        10000,
+		MaxInFlight:       32,
+		OverflowPolicy:    OverflowReject,
+		DeIDSalt:          "local-dev-salt-v1",
+		ResetOutput:       false,
+		MaxPendingReviews: 1000,
+		MaxReplayTasks:    2,
 	}
 }
 
@@ -53,6 +63,12 @@ func (c Config) Validate() error {
 	case OverflowReject, OverflowDegrade:
 	default:
 		return errors.New("invalid overflow policy")
+	}
+	if c.MaxPendingReviews < 0 {
+		return errors.New("max pending reviews must be >= 0")
+	}
+	if c.MaxReplayTasks < 0 {
+		return errors.New("max replay tasks must be >= 0")
 	}
 	return nil
 }

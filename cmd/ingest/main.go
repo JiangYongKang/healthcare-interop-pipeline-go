@@ -78,12 +78,42 @@ func run() error {
 		return err
 	}
 
-	fmt.Printf("\nsummary: files=%d accepted=%d duplicate=%d outOfOrder=%d degraded=%d rejected=%d -> %s/records.jsonl\n",
+	fmt.Printf("\nsummary: files=%d accepted=%d duplicate=%d outOfOrder=%d conflict=%d degraded=%d rejected=%d -> %s/records.jsonl\n",
 		len(results),
 		counts[pipeline.OutcomeAccepted], counts[pipeline.OutcomeDuplicate],
-		counts[pipeline.OutcomeOutOfOrder], counts[pipeline.OutcomeDegraded],
+		counts[pipeline.OutcomeOutOfOrder], counts[pipeline.OutcomeConflict],
+		counts[pipeline.OutcomeDegraded],
 		counts[pipeline.OutcomeRejected], *out)
+
+	// Event consistency view: one chain per clinical event.
+	chains, err := eng.Chains(ctx)
+	if err != nil {
+		return err
+	}
+	for _, c := range chains {
+		eff := "-"
+		if c.Effective != nil {
+			eff = fmt.Sprintf("%s/%s value=%q", c.Effective.SourceFormat, c.Effective.SourceVersion, c.Effective.Value)
+		}
+		fmt.Printf("[chain] %s eventId=%s patient=%s status=%s deliveries=%d pending=%d effective=%s\n",
+			c.ChainID, c.EventID, c.PatientRef, c.Status, len(c.Deliveries), c.PendingConflicts, eff)
+	}
+	pending, err := eng.PendingConflicts(ctx)
+	if err != nil {
+		return err
+	}
+	for _, c := range pending {
+		fmt.Printf("[pending-review] %s eventId=%s reason=%s current=%s incoming=%s\n",
+			c.ConflictID, c.EventID, c.Reason, short(c.CurrentDigest), short(c.IncomingDigest))
+	}
 	return nil
+}
+
+func short(d string) string {
+	if len(d) > 12 {
+		return d[:12]
+	}
+	return d
 }
 
 func listMessageFiles(dir string) ([]string, error) {

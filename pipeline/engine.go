@@ -18,6 +18,8 @@ type Result struct {
 	Reason   string
 	Error    *IngestionError
 	Decision *Decision
+	// ConflictID is set when the delivery was parked for review.
+	ConflictID string
 }
 
 // Engine orchestrates parse -> normalize -> de-identify -> persist and
@@ -263,7 +265,7 @@ func (e *Engine) commitPrepared(ctx context.Context, item *preparedIngest) *Resu
 		return item.res
 	}
 	d, serr := e.store.Submit(ctx, item.rec)
-	r := &Result{EventID: item.rec.EventID, Decision: d}
+	r := &Result{EventID: item.rec.EventID, Decision: d, ConflictID: d.ConflictID}
 	if serr != nil {
 		var ie *IngestionError
 		if errors.As(serr, &ie) {
@@ -288,6 +290,28 @@ func (e *Engine) Snapshot(ctx context.Context) ([]*Record, error) {
 // Decisions returns the full traceable decision journal.
 func (e *Engine) Decisions(ctx context.Context) ([]*Decision, error) {
 	return e.store.Decisions(ctx)
+}
+
+// Chains returns the event consistency view across all chains.
+func (e *Engine) Chains(ctx context.Context) ([]*ChainView, error) {
+	return e.store.Chains(ctx)
+}
+
+// PendingConflicts lists conflicts awaiting review.
+func (e *Engine) PendingConflicts(ctx context.Context) ([]*Conflict, error) {
+	return e.store.PendingConflicts(ctx)
+}
+
+// ResolveConflict applies a deterministic review conclusion. Re-applying
+// the same conclusion is idempotent.
+func (e *Engine) ResolveConflict(ctx context.Context, conflictID string, choice ResolutionChoice, reviewer string) (*ReviewResult, error) {
+	return e.store.Resolve(ctx, conflictID, choice, reviewer)
+}
+
+// Replay rebuilds chain state from the journals and verifies it equals
+// the live state.
+func (e *Engine) Replay(ctx context.Context) (*ReplayReport, error) {
+	return e.store.Replay(ctx)
 }
 
 // Close flushes all journals and releases resources.

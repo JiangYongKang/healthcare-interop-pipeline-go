@@ -15,12 +15,16 @@
 | fhir_obs_r4_other.json | FHIR R4 Observation | 同患者 MRN-1001，验证纵向关联 |
 | fhir_unknown_fields_ok.json | FHIR R4 Observation | 未知 extension/display 必须被接受并令牌化 |
 
-## 重复 / 乱序
+| fhir_obs_r4_evt0001.json | FHIR R4 Observation | 与 hl7_obs_v23_ok 同一事件 EVT-0001（跨格式归链，R4 胜出） |
+
+## 重复 / 乱序 / 冲突
 | 文件 | 预期 |
 |---|---|
 | hl7_dup_0001.hl7 | 与 hl7_obs_v23_ok 完全相同 → DUPLICATE |
 | fhir_dup_1001.json | 与 fhir_obs_r4_ok 完全相同 → DUPLICATE |
 | hl7_stale_0002.hl7 | 同 id 的 2.3/更早时间修订；新 2.5.1 已在位时 → OUT_OF_ORDER |
+| hl7_obs_v23_ok.hl7 | EVT-0001 的 FHIR R4 版本已在位（字典序先摄入）→ OUT_OF_ORDER |
+| hl7_zconflict_0004.hl7 | 与 hl7_enc_v251_ok 同版本同时间不同内容 → CONFLICT（待复核） |
 
 ## 畸形 / 校验失败（拒绝原因可区分）
 | 文件 | 拒绝原因 | 对外类型 |
