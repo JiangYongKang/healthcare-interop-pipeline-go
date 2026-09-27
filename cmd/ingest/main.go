@@ -103,8 +103,12 @@ func run() error {
 		return err
 	}
 	for _, c := range pending {
-		fmt.Printf("[pending-review] %s eventId=%s reason=%s current=%s incoming=%s\n",
-			c.ConflictID, c.EventID, c.Reason, short(c.CurrentDigest), short(c.IncomingDigest))
+		extra := ""
+		if c.Reason == pipeline.ReasonPatientMismatch {
+			extra = fmt.Sprintf(" currentPatient=%s incomingPatient=%s", c.CurrentPatient, c.IncomingPatient)
+		}
+		fmt.Printf("[pending-review] %s eventId=%s reason=%s current=%s incoming=%s%s\n",
+			c.ConflictID, c.EventID, c.Reason, short(c.CurrentDigest), short(c.IncomingDigest), extra)
 	}
 	return nil
 }

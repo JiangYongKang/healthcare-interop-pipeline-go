@@ -11,10 +11,19 @@ import (
 type ConflictReason string
 
 const (
-	// ReasonContentConflict: two deliveries carry the same revision
-	// coordinates (format-version ordinal + effective time) but
-	// different business content. Never resolved silently.
+	// ReasonContentConflict: two deliveries of the same clinical event
+	// (same event id, same clinical effective time, same patient) carry
+	// different clinical content (status/result/code/unit). Source format
+	// and version never override this: a higher version ordinal with the
+	// same effective time cannot silently overwrite the effective result.
+	// Never resolved silently.
 	ReasonContentConflict ConflictReason = "CONTENT_CONFLICT_SAME_REVISION"
+	// ReasonPatientMismatch: two deliveries of the same clinical event id
+	// reference different patients. The chain's patient linkage and
+	// effective result are retained; the delivery is parked for review.
+	// This is distinct from a content conflict so the two causes stay
+	// independently queryable.
+	ReasonPatientMismatch ConflictReason = "PATIENT_MISMATCH_SAME_EVENT"
 )
 
 // ConflictStatus is the lifecycle state of a detected conflict.
@@ -55,9 +64,15 @@ type Conflict struct {
 	Reason         ConflictReason `json:"reason"`
 	CurrentDigest  string         `json:"currentDigest"`
 	IncomingDigest string         `json:"incomingDigest"`
-	Status         ConflictStatus `json:"status"`
-	Resolution     *Resolution    `json:"resolution,omitempty"`
-	DetectedSeq    int64          `json:"detectedSeq"`
+	// CurrentPatient/IncomingPatient are the de-identified patient
+	// pseudonyms of the two disagreeing deliveries. They are populated
+	// for PATIENT_MISMATCH_SAME_EVENT so the cause is auditable without
+	// exposing raw identifiers.
+	CurrentPatient  string         `json:"currentPatientRef,omitempty"`
+	IncomingPatient string         `json:"incomingPatientRef,omitempty"`
+	Status          ConflictStatus `json:"status"`
+	Resolution      *Resolution    `json:"resolution,omitempty"`
+	DetectedSeq     int64          `json:"detectedSeq"`
 }
 
 // conflictIDFor builds a deterministic conflict identifier: the same

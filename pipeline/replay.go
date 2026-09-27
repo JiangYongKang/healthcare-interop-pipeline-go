@@ -103,6 +103,15 @@ func compareModels(live, rebuilt *chainModel) *ReplayReport {
 		if rc.Status != lc.Status {
 			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("conflict %s status live=%s replay=%s", cid, lc.Status, rc.Status))
 		}
+		if rc.Reason != lc.Reason {
+			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("conflict %s reason live=%s replay=%s", cid, lc.Reason, rc.Reason))
+		}
+		if (lc.Resolution == nil) != (rc.Resolution == nil) {
+			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("conflict %s resolution presence live=%v replay=%v", cid, lc.Resolution != nil, rc.Resolution != nil))
+		} else if lc.Resolution != nil && (lc.Resolution.Choice != rc.Resolution.Choice ||
+			lc.Resolution.WinnerDigest != rc.Resolution.WinnerDigest) {
+			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("conflict %s resolution live=%+v replay=%+v", cid, lc.Resolution, rc.Resolution))
+		}
 	}
 	for cid := range rebuilt.conflicts {
 		if live.conflicts[cid] == nil {

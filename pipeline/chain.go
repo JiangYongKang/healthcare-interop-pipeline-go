@@ -24,6 +24,7 @@ const (
 type DeliveryView struct {
 	Seq           int64   `json:"seq"`
 	EventID       string  `json:"eventId"`
+	PatientRef    string  `json:"patientRef"` // pseudonym of this delivery (audit for patient mismatches)
 	Format        string  `json:"format"`
 	Version       string  `json:"version"`
 	Outcome       Outcome `json:"outcome"`
@@ -149,17 +150,31 @@ func (m *chainModel) applyCommitted(rec *Record, seq int64, outcome Outcome, rea
 		if cur != nil {
 			curDigest = businessDigest(cur)
 		}
+		// Derive the stable conflict reason from the disagreeing pair
+		// itself, so replay reaches the same classification regardless
+		// of arrival order: a different patient on one chain is a
+		// patient mismatch; otherwise it is a content conflict.
+		reason := ReasonContentConflict
+		curPatient, inPatient := "", rec.PatientRef
+		if cur != nil {
+			curPatient = cur.PatientRef
+			if cur.PatientRef != rec.PatientRef {
+				reason = ReasonPatientMismatch
+			}
+		}
 		cid := conflictIDFor(rec.EventID, curDigest, digest)
 		if _, ok := m.conflicts[cid]; !ok {
 			m.conflicts[cid] = &Conflict{
-				ConflictID:     cid,
-				ChainID:        chain.id,
-				EventID:        rec.EventID,
-				Reason:         ReasonContentConflict,
-				CurrentDigest:  curDigest,
-				IncomingDigest: digest,
-				Status:         ConflictPending,
-				DetectedSeq:    seq,
+				ConflictID:      cid,
+				ChainID:         chain.id,
+				EventID:         rec.EventID,
+				Reason:          reason,
+				CurrentDigest:   curDigest,
+				IncomingDigest:  digest,
+				CurrentPatient:  curPatient,
+				IncomingPatient: inPatient,
+				Status:          ConflictPending,
+				DetectedSeq:     seq,
 			}
 			m.pending++
 		}
@@ -229,6 +244,7 @@ func (m *chainModel) chainViews() []*ChainView {
 			view.Deliveries = append(view.Deliveries, &DeliveryView{
 				Seq:           rev.seq,
 				EventID:       rev.rec.EventID,
+				PatientRef:    rev.rec.PatientRef,
 				Format:        rev.rec.SourceFormat,
 				Version:       rev.rec.SourceVersion,
 				Outcome:       rev.outcome,

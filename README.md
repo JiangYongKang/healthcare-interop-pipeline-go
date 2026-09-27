@@ -63,40 +63,69 @@
 
 - **事件链**：同一临床事件由事件 id（HL7 MSH-10 / FHIR `id`，上游系统对同一事件
   跨格式/跨版本保持不变）归组为一条链 `CHAIN-<hash>`。同一事件无论来自 HL7 2.3/2.5.1
-  还是 FHIR STU3/R4，都进入同一条链；链内保留每次投递的来源（格式/版本）、生效时间、
-  到达序号与最终状态，以及当前有效版本。链视图只含去标识数据（患者为 `PAT-` 占位值），
-  患者纵向关联通过占位值保持可用。
-- **幂等键**：`eventId`。业务内容指纹为除到达元数据外全部业务字段（含未知字段）的
-  SHA-256。完全相同的重复投递判定为 `DUPLICATE`，不再产生记录、不占容量，无论投递
-  多少次、跨不跨重启。
-- **修订裁决规则（与到达顺序无关，纯确定性）**：版本序（`2.3 < 2.5.1 < STU3 < R4`）
-  → 生效时间。**内容指纹不再是裁决依据**：坐标相同而内容不同的投递属于冲突（见第 5
-  节），绝不静默覆盖。
-  - 较新修订后到：`ACCEPTED` 并记录"取代先前版本"；
-  - **较旧修订后到（乱序）：绝不静默覆盖较新数据**，标记 `OUT_OF_ORDER`，
-    原因中给出双方版本与时间；旧修订仍以只追加方式留在 `revisions.jsonl` 可追溯。
-  - 无论乱序消息先后如何到达，最终胜出记录集合完全一致（可复现）。
+  还是 FHIR STU3/R4，都进入同一条链；链内保留每次投递的来源（格式/版本）、**各自的
+  患者占位**、生效时间、到达序号与最终状态，以及当前有效版本。链视图只含去标识数据
+  （患者为 `PAT-` 占位值），患者纵向关联通过占位值保持可用。
+  - **链状态**：`EFFECTIVE`（有当前有效版本且无未决冲突）/ `PENDING_REVIEW`
+    （存在未决内容或患者冲突，最后有效版本继续作为对外结果）。
+  - 同一事件 id 上出现不同患者时，**链的患者关联与有效版本都不被改写**；冲突投递
+    仍保留在链内，其患者占位可在投递视图中区分，等待复核裁决。
+- **幂等键**：`eventId`。系统维护两类指纹：
+  - **业务指纹** `businessDigest`：除到达元数据外全部业务字段（含来源格式/版本、
+    代码系统、未知字段）的 SHA-256，用于**精确重复投递**判定——逐字节等价的重投
+    判定为 `DUPLICATE`，不再产生记录、不占容量，无论投递多少次、跨不跨重启。
+  - **临床语义指纹** `clinicalDigest`：仅事件类型、归一状态、代码、结果值、单位
+    （单位大小写不敏感），与格式/版本无关，用于同一生效时间下的内容一致性判定
+    （见第 5 节）。跨格式但临床等价的投递不是重复、也不是冲突，按修订规则归位。
+- **修订裁决规则（与到达顺序无关，纯确定性）**
+  - 先比较**临床生效时间**：生效时间更晚的修订取代更早的修订；生效时间更早
+    的修订晚到则标记 `OUT_OF_ORDER`，绝不覆盖。
+  - **同一临床生效时间**下先比较**临床内容语义指纹** `clinicalDigest`
+    （事件类型、归一状态、代码、结果值、单位，单位大小写不敏感；**不含**来源格式/版本、
+    代码系统与显示名拼写、未知字段）。语义一致才进入版本序比较
+    （`2.3 < 2.5.1 < STU3 < R4`）：高版本以 `ACCEPTED` 取代，同序则保留等价结果。
+    语义不同即属于内容冲突（见第 5 节），**版本序再高也绝不静默覆盖**——因此
+    较旧/较低优先级消息晚到虽不会改变有效结果，但"内容确实不一致"的判定不会因为
+    格式/版本排序被跳过。
+  - **跨格式/跨版本等价投递**：HL7 `cel` 与 FHIR `Cel`、代码系统缺省差异
+    （`L`/`LN`/`http://loinc.org`）等格式方言差异不计入语义分歧。
+  - 无论消息谁先到谁后到，有效结果与冲突判定集合完全一致（可复现）。
 - 快照按 `(eventTime, eventId)` 排序输出，乱序消息因此在结果视图中归位。
 
 ## 5. 冲突复核与确定性裁决
 
-- **冲突判定**：投递与当前有效版本的修订坐标（版本序 + 生效时间）完全相同、但业务
-  内容指纹不同 → 判定 `CONFLICT`，附稳定机器原因 `CONTENT_CONFLICT_SAME_REVISION`；
-  该投递以只追加方式保留在 `revisions.jsonl`，**当前有效版本不变**，链进入
-  `PENDING_REVIEW` 状态。
-- **冲突标识**：`CON-<hash(eventId, 双方指纹)>`，同一对冲突内容永远得到同一 id，
-  重复检测不会产生重复冲突记录；冲突写入 `conflicts.jsonl` 并可通过
-  `PendingConflicts` 查询。
+系统区分两类**稳定、可机器区分**的冲突原因；两种情形都只追加保留投递、
+**当前有效版本与链状态保持不变**、链进入 `PENDING_REVIEW`：
+
+| 稳定原因码 | 判定条件 | 保留/不改写的内容 |
+|---|---|---|
+| `CONTENT_CONFLICT_SAME_REVISION` | 同一事件 id、**同一患者**、**同一临床生效时间**，但临床语义指纹不同（归一状态/结果值/代码/单位对不上）。与来源格式、版本序无关：高版本不会静默覆盖。 | 当前有效版本 |
+| `PATIENT_MISMATCH_SAME_EVENT` | 同一事件 id 的投递引用了**另一个患者**（患者占位不同）。优先于内容冲突判定。 | 链已有的患者关联与当前有效版本 |
+
+- **判定依据留痕**：决策日志 `reason` 以稳定原因码开头，并附双方版本/格式、版本序、
+  生效时间、双方业务指纹（患者不一致时另附双方患者占位），不暴露任何原始 PHI。
+  链视图的每次投递都带各自的去标识患者占位，患者不一致可逐投递审计。
+- **与到达顺序无关**：冲突 id 为 `CON-<hash(eventId, 双方业务指纹)>`，指纹对按字典序
+  排序，同一对内容无论谁先到都得到同一个 id；两条消息以任意顺序到达，有效结果与冲突
+  集合一致。较旧/较低优先级消息晚到不会改变有效结果，但同生效时间的内容不一致不会被
+  版本序排序跳过（旧版本晚到同样判内容冲突）。
+- **冲突生命周期**：冲突写入 `conflicts.jsonl` 并可通过 `PendingConflicts` 查询；
+  重复检测到同一对内容不会产生重复冲突记录。
 - **复核结论**：`ResolveConflict(conflictId, KEEP_CURRENT|ACCEPT_INCOMING, reviewer)`
-  - `KEEP_CURRENT`：保留当前有效版本；`ACCEPT_INCOMING`：把冲突投递提升为有效版本。
+  - `KEEP_CURRENT`：保留当前有效版本；`ACCEPT_INCOMING`：把冲突投递提升为有效版本
+    （含患者不一致冲突：复核人可据此把链的有效版本切换到另一患者的投递）。
   - 结论先写 `reviews.jsonl`（提交点）并 fsync，再在锁内原子更新链状态与对外结果，
-    不会留下只完成一半的复核。
-  - **幂等**：同一结论重复应用返回既有结论、不写新日志、不改状态；对已结冲突给出
-    不同结论则拒绝（`CONFLICT_ALREADY_RESOLVED`）。未知冲突与非法结论分别返回
-    `UNKNOWN_CONFLICT` / `INVALID_RESOLUTION`。
-- **待复核积压上限**：`maxPendingReviews`（0=不限，默认 1000）。超限时按 `-policy`
-  处理：`reject` → 该投递 `REJECTED`（`STORAGE_CONFLICT`）；`degrade` → 写入
-  `degraded.jsonl` 并记 `DEGRADED`。两种策略下积压都可查询，且无部分写入。
+    然后才写信息性 `REVIEW_APPLIED` 决策，不会留下只完成一半的复核。
+  - **幂等**：同一结论重复应用返回既有结论、不写新日志、不改状态、不产生重复记录；
+    对已结冲突给出不同结论则拒绝（`CONFLICT_ALREADY_RESOLVED`）。未知冲突与非法结论
+    分别返回 `UNKNOWN_CONFLICT` / `INVALID_RESOLUTION`。
+- **待复核积压上限**：`maxPendingReviews`（0=不限，默认 1000），对两类冲突同等生效。
+  超限时按 `-policy` 处理：`reject` → 该投递 `REJECTED`（`STORAGE_CONFLICT`）；
+  `degrade` → 写入 `degraded.jsonl` 并记 `DEGRADED`。两种策略下积压都可查询，且无
+  部分写入（容量计数只在新冲突真正登记时增长）。
+- **重启与回放**：冲突原因在重放时由"双方患者占位 + 临床内容"重新派生（患者不一致
+  优先），因此重启重建与运行时一致性回放得到完全相同的冲突原因、状态与裁决；
+  `Replay()` 逐链比对有效版本指纹、冲突原因、状态与裁决结论。
 
 ## 6. 一致性回放
 
@@ -145,7 +174,7 @@
 | `revisions.jsonl` | 所有非重复修订（含乱序旧修订），只追加，用于审计与重放 |
 | `decisions.jsonl` | 每条消息的判定：`ACCEPTED/REJECTED/DUPLICATE/OUT_OF_ORDER/CONFLICT/DEGRADED/REVIEW_APPLIED` + 原因/错误类型/格式/版本/链与冲突 id |
 | `degraded.jsonl` | 容量/积压超限降级模式下的记录 |
-| `conflicts.jsonl` | 检测到的内容冲突（id、双方内容指纹、状态），审计用 |
+| `conflicts.jsonl` | 检测到的冲突（id、稳定原因 `CONTENT_CONFLICT_SAME_REVISION`/`PATIENT_MISMATCH_SAME_EVENT`、双方内容指纹、双方患者占位、状态与裁决），审计用 |
 | `reviews.jsonl` | 复核结论（提交点）：冲突 id、裁决、胜出指纹、复核人、序号 |
 | `replay.jsonl` | 每次一致性回放的报告（含被积压上限拒绝的回放） |
 
@@ -169,6 +198,19 @@ go run ./cmd/ingest -dir testdata/samples -out output -reset
 # 测试（含竞态检测；日志中打印消息标识 eventId 与判定依据）
 go test -race ./...
 go test ./... -v     # 查看每条用例的 eventId 与 basis= 判定依据
+
+# 只跑事件一致性/冲突复核相关用例
+go test ./pipeline/ -run 'TestChain|TestConflict|TestResolve|TestHigherVersion|TestCrossVersion|TestPatientMismatch|TestLateLowerVersion|TestStatusDisagreement|TestConcurrentMixed' -v
+
+# 复现"高版本静默覆盖"缺陷修复：同一事件同临床时间、2.3 先到、R4 携带不同值，
+# 结果必须是 CONFLICT/CONTENT_CONFLICT_SAME_REVISION 且有效版本仍是 2.3
+go test ./pipeline/ -run TestHigherVersionDoesNotSilentlyOverwrite -v
+
+# 复现跨格式/跨版本内容冲突的两种到达顺序（冲突 id 相同、首个到达者保持有效）
+go test ./pipeline/ -run 'TestChainCrossFormatContentConflictBothOrders|TestCrossVersionContentConflictOrderIndependent' -v
+
+# 复现患者不一致（两种到达顺序、积压策略、复核原子性与重启一致性）
+go test ./pipeline/ -run 'TestChainPatientMismatchBothOrders|TestPatientMismatch' -v
 ```
 
 样例语料覆盖：HL7 2.3/2.5.1 与 FHIR STU3/R4 合法消息；同一事件重复投递（含

@@ -445,6 +445,22 @@ func businessDigest(r *Record) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// clinicalDigest hashes only the clinical facts that must agree across
+// format/version re-deliveries of the same event: event type, status,
+// code, result value and unit. Source format/version, code system and
+// display spelling (format-specific defaults/casing), unknown/extension
+// leaves and timestamps are deliberately excluded, so semantically equal
+// re-deliveries in HL7 2.3 and FHIR R4 compare equal. Units are compared
+// case-insensitively because HL7 ("cel") and FHIR ("Cel") use different
+// capitalization for the same UCUM unit. The digest is compared only
+// within one event chain, so eventId is not part of it.
+func clinicalDigest(r *Record) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%s",
+		r.EventType, r.Status, r.Code, r.Value, strings.ToLower(r.Unit))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func sortedKeys(m map[string]string) []string {
 	ks := make([]string, 0, len(m))
 	for k := range m {
@@ -510,57 +526,88 @@ func (s *fileStore) Submit(_ context.Context, rec *Record) (*Decision, error) {
 	outcome := OutcomeAccepted
 	var conflict *Conflict
 	if cur != nil {
-		switch cmp := compareCoords(rec, cur); {
-		case cmp > 0:
-			d.Reason = fmt.Sprintf("newer revision supersedes prior (ordinal=%d time=%s)",
-				versionOrdinal(cur.SourceVersion), effectiveOf(cur))
-		case cmp == 0:
-			// Same revision coordinates, different business content:
-			// never silently overwrite. Park for deterministic review.
+		var reason ConflictReason
+		var differs bool
+		switch {
+		case rec.PatientRef != cur.PatientRef:
+			// Different patient on the same event id: the chain linkage
+			// must never be rewritten. Distinguished from a content
+			// conflict by its own stable reason.
+			reason, differs = ReasonPatientMismatch, true
+		case effectiveOf(rec) == effectiveOf(cur) && clinicalDigest(rec) != clinicalDigest(cur):
+			// Same clinical time, same patient, but different clinical
+			// facts. Version ordinal is irrelevant: a higher version
+			// never silently overwrites the effective result.
+			reason, differs = ReasonContentConflict, true
+		}
+		if differs {
+			curDigest, inDigest := businessDigest(cur), digest
+			cid := conflictIDFor(rec.EventID, curDigest, inDigest)
+			// Backlog cap applies to both conflict kinds; the overflow
+			// decision is the same whichever reason was detected.
 			if s.cfg.MaxPendingReviews > 0 && s.model.pending >= s.cfg.MaxPendingReviews {
-				switch s.cfg.OverflowPolicy {
-				case OverflowReject:
-					d.Outcome = OutcomeRejected
-					d.Reason = fmt.Sprintf("pending review backlog limit %d reached; reject policy", s.cfg.MaxPendingReviews)
-					d.ErrorType = string(ErrStorageConflict)
-					if err := s.appendDecision(d); err != nil {
-						return nil, err
+				if _, exists := s.model.conflicts[cid]; !exists {
+					switch s.cfg.OverflowPolicy {
+					case OverflowReject:
+						d.Outcome = OutcomeRejected
+						d.Reason = fmt.Sprintf("pending review backlog limit %d reached; reject policy", s.cfg.MaxPendingReviews)
+						d.ErrorType = string(ErrStorageConflict)
+						if err := s.appendDecision(d); err != nil {
+							return nil, err
+						}
+						return d, conflictErr(d, "pending review backlog limit reached")
+					case OverflowDegrade:
+						d.Outcome = OutcomeDegraded
+						d.Reason = fmt.Sprintf("pending review backlog limit %d reached; degraded journal", s.cfg.MaxPendingReviews)
+						if err := s.appendJSON(s.degFile, rec); err != nil {
+							return nil, err
+						}
+						if err := s.appendDecision(d); err != nil {
+							return nil, err
+						}
+						return d, nil
 					}
-					return d, conflictErr(d, "pending review backlog limit reached")
-				case OverflowDegrade:
-					d.Outcome = OutcomeDegraded
-					d.Reason = fmt.Sprintf("pending review backlog limit %d reached; degraded journal", s.cfg.MaxPendingReviews)
-					if err := s.appendJSON(s.degFile, rec); err != nil {
-						return nil, err
-					}
-					if err := s.appendDecision(d); err != nil {
-						return nil, err
-					}
-					return d, nil
 				}
 			}
 			outcome = OutcomeConflict
-			cid := conflictIDFor(rec.EventID, businessDigest(cur), digest)
 			d.ConflictID = cid
-			d.Reason = fmt.Sprintf("%s: identical revision coordinates (ordinal=%d time=%s) but different content; parked for review as %s; effective version retained",
-				ReasonContentConflict, versionOrdinal(rec.SourceVersion), effectiveOf(rec), cid)
+			d.Reason = s.conflictReasonText(reason, cur, rec, cid)
 			if _, exists := s.model.conflicts[cid]; !exists {
 				conflict = &Conflict{
-					ConflictID:     cid,
-					ChainID:        chain.id,
-					EventID:        rec.EventID,
-					Reason:         ReasonContentConflict,
-					CurrentDigest:  businessDigest(cur),
-					IncomingDigest: digest,
-					Status:         ConflictPending,
-					DetectedSeq:    d.Seq,
+					ConflictID:      cid,
+					ChainID:         chain.id,
+					EventID:         rec.EventID,
+					Reason:          reason,
+					CurrentDigest:   curDigest,
+					IncomingDigest:  inDigest,
+					CurrentPatient:  cur.PatientRef,
+					IncomingPatient: rec.PatientRef,
+					Status:          ConflictPending,
+					DetectedSeq:     d.Seq,
 				}
 			}
-		default:
-			outcome = OutcomeOutOfOrder
-			d.Reason = fmt.Sprintf("stale revision (winner ordinal=%d time=%s vs incoming ordinal=%d time=%s); newer data retained",
-				versionOrdinal(cur.SourceVersion), effectiveOf(cur),
-				versionOrdinal(rec.SourceVersion), effectiveOf(rec))
+		} else {
+			// Same patient, clinical facts agree at this effective time.
+			// Apply the deterministic revision rule (version ordinal,
+			// then effective time); it never decides disagreeing content.
+			switch cmp := compareCoords(rec, cur); {
+			case cmp > 0:
+				d.Reason = fmt.Sprintf("newer revision supersedes prior (ordinal=%d time=%s)",
+					versionOrdinal(cur.SourceVersion), effectiveOf(cur))
+			case cmp == 0:
+				// Same ordinal and same effective time with equal
+				// clinical facts: representation differs (e.g. another
+				// format's code-system default), so it is not an exact
+				// duplicate; it replaces no clinical fact. The incoming
+				// revision becomes effective but yields the same view.
+				d.Reason = fmt.Sprintf("equivalent revision at same coordinates (ordinal=%d time=%s); no clinical fact changed",
+					versionOrdinal(rec.SourceVersion), effectiveOf(rec))
+			default:
+				outcome = OutcomeOutOfOrder
+				d.Reason = fmt.Sprintf("stale revision (winner ordinal=%d time=%s vs incoming ordinal=%d time=%s); newer data retained",
+					versionOrdinal(cur.SourceVersion), effectiveOf(cur),
+					versionOrdinal(rec.SourceVersion), effectiveOf(rec))
+			}
 		}
 	}
 
@@ -593,6 +640,23 @@ func conflictErr(d *Decision, msg string) error {
 	return &IngestionError{
 		Type: ErrStorageConflict, Message: msg, Reason: string(d.Outcome),
 		EventID: d.EventID, Detail: d.Reason,
+	}
+}
+
+// conflictReasonText renders the stable, machine-distinguishable reason
+// plus the human-auditable judgment basis (arrival-independent facts)
+// written into the decision journal.
+func (s *fileStore) conflictReasonText(reason ConflictReason, cur, rec *Record, cid string) string {
+	switch reason {
+	case ReasonPatientMismatch:
+		return fmt.Sprintf("%s: event id %s delivered for patient %s while the chain belongs to %s; chain patient linkage and effective version retained; parked for review as %s",
+			reason, rec.EventID, rec.PatientRef, cur.PatientRef, cid)
+	default:
+		return fmt.Sprintf("%s: same clinical effective time %s (incoming ordinal=%d %s/%s vs current ordinal=%d %s/%s) but different clinical content (digests incoming=%s current=%s); parked for review as %s; effective version retained",
+			reason, effectiveOf(rec),
+			versionOrdinal(rec.SourceVersion), rec.SourceFormat, rec.SourceVersion,
+			versionOrdinal(cur.SourceVersion), cur.SourceFormat, cur.SourceVersion,
+			shortDigest(businessDigest(rec)), shortDigest(businessDigest(cur)), cid)
 	}
 }
 
