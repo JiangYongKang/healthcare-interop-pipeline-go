@@ -38,3 +38,15 @@
 | fhir_bad_status.json | INVALID_STATUS（"purple"） | VALIDATION_ERROR |
 | fhir_bad_version.json | UNSUPPORTED_VERSION（DSTU2） | FORMAT_ERROR |
 | fhir_bad_time.json | INVALID_TIME | FORMAT_ERROR |
+
+# 一致性样例目录（testdata/consistency）
+
+被一致性测试（`chain_test.go` / `review_test.go` / `replay_test.go`）与
+`cmd/ingest -dir testdata/consistency` 使用；不影响 `testdata/samples` 的既有判定分布。
+
+| 文件 | 场景 | 预期 |
+|---|---|---|
+| c01_hl7_evt5001.hl7 / c02_fhir_evt5001.json | 同一事件 EVT-5001 跨 HL7 2.5.1 与 FHIR R4 到达，临床事实一致 | 归入同一事件链；后者保留为 STALE（表示层差异不视为冲突） |
+| c03_fhir_evt5002.json / c04_hl7_evt5002_conflict.hl7 | EVT-5002 同一生效时间、不同体重值（71.2 vs 95.0） | `CONFLICT` + `CONFLICT_VALUE`，链进入 PENDING_REVIEW，当前有效版本保留 |
+| c05_hl7_evt5003.hl7 / c06_hl7_evt5003_late_old.hl7 / c07_fhir_evt5003_amended.json | EVT-5003：新修订先到、旧修订晚到、随后 amended 修订 | 旧修订 `OUT_OF_ORDER` 不改变结果；`amended` 在相同生效时间取代 `final` |
+| c08_fhir_evt5004.json / c09_hl7_evt5004_wrongpatient.hl7 | EVT-5004 同一事件 id 但患者不同 | `CONFLICT` + `CONFLICT_PATIENT`，链进入 PENDING_REVIEW |

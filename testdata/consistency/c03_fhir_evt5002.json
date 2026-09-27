@@ -1,0 +1,10 @@
+{
+  "resourceType": "Observation",
+  "id": "EVT-5002",
+  "meta": {"fhirVersion": "4.0"},
+  "status": "final",
+  "subject": {"reference": "Patient/MRN-5002"},
+  "code": {"coding": [{"system": "LN", "code": "29463-7", "display": "Body Weight"}]},
+  "valueQuantity": {"value": 71.2, "unit": "kg"},
+  "effectiveDateTime": "2026-09-11T10:00:00Z"
+}

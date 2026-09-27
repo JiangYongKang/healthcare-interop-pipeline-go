@@ -28,6 +28,15 @@ type Config struct {
 	// ResetOutput clears prior output at Open. When false, the store
 	// replays its journals, guaranteeing idempotence across restarts.
 	ResetOutput bool
+	// MaxPendingReviews caps event chains simultaneously waiting for a
+	// conflict review. 0 means unlimited. Overflow follows OverflowPolicy
+	// (reject the conflicting delivery, or degrade it to the degraded
+	// journal); either way the decision stays queryable.
+	MaxPendingReviews int
+	// MaxReplayTasks bounds queued consistency-replay tasks. 0 means 1.
+	// Duplicate requests coalesce onto the pending task; a full queue
+	// follows OverflowPolicy and is journaled, never half-executed.
+	MaxReplayTasks int
 }
 
 // DefaultConfig returns conservative local defaults.
@@ -54,5 +63,19 @@ func (c Config) Validate() error {
 	default:
 		return errors.New("invalid overflow policy")
 	}
+	if c.MaxPendingReviews < 0 {
+		return errors.New("max pending reviews must not be negative")
+	}
+	if c.MaxReplayTasks < 0 {
+		return errors.New("max replay tasks must not be negative")
+	}
 	return nil
+}
+
+// replayQueueCap resolves the effective replay queue capacity.
+func (c Config) replayQueueCap() int {
+	if c.MaxReplayTasks <= 0 {
+		return 1
+	}
+	return c.MaxReplayTasks
 }

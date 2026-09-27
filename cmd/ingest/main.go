@@ -27,6 +27,9 @@ func run() error {
 	policy := flag.String("policy", string(pipeline.OverflowReject), "overflow policy: reject|degrade")
 	maxRecords := flag.Int("max-records", 10000, "maximum accepted distinct events (0=unlimited)")
 	maxInFlight := flag.Int("max-inflight", 32, "maximum concurrently processed messages")
+	maxPending := flag.Int("max-pending-reviews", 0, "maximum chains pending conflict review (0=unlimited)")
+	maxReplay := flag.Int("max-replay-tasks", 1, "maximum queued consistency-replay tasks")
+	replay := flag.Bool("replay", false, "run a consistency replay after ingestion and print the report")
 	reset := flag.Bool("reset", false, "reset output directory before ingestion")
 	flag.Parse()
 
@@ -35,6 +38,8 @@ func run() error {
 	cfg.OverflowPolicy = pipeline.OverflowPolicy(*policy)
 	cfg.MaxRecords = *maxRecords
 	cfg.MaxInFlight = *maxInFlight
+	cfg.MaxPendingReviews = *maxPending
+	cfg.MaxReplayTasks = *maxReplay
 	cfg.ResetOutput = *reset
 
 	eng, err := pipeline.NewEngine(cfg)
@@ -78,11 +83,38 @@ func run() error {
 		return err
 	}
 
-	fmt.Printf("\nsummary: files=%d accepted=%d duplicate=%d outOfOrder=%d degraded=%d rejected=%d -> %s/records.jsonl\n",
+	fmt.Printf("\nsummary: files=%d accepted=%d duplicate=%d outOfOrder=%d conflict=%d degraded=%d rejected=%d -> %s/records.jsonl\n",
 		len(results),
 		counts[pipeline.OutcomeAccepted], counts[pipeline.OutcomeDuplicate],
-		counts[pipeline.OutcomeOutOfOrder], counts[pipeline.OutcomeDegraded],
+		counts[pipeline.OutcomeOutOfOrder], counts[pipeline.OutcomeConflict],
+		counts[pipeline.OutcomeDegraded],
 		counts[pipeline.OutcomeRejected], *out)
+
+	// Event-consistency view: chains waiting for a conflict review.
+	pending, err := eng.PendingReviews(ctx)
+	if err != nil {
+		return err
+	}
+	for _, id := range pending {
+		view, err := eng.Chain(ctx, id)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("[PENDING_REVIEW] eventId=%s deliveries=%d currentValue=%s basis=%s\n",
+			id, len(view.Deliveries), view.Current.Value, view.Deliveries[len(view.Deliveries)-1].Reason)
+	}
+	if len(pending) > 0 {
+		fmt.Printf("pending reviews: %d chain(s) await a review conclusion\n", len(pending))
+	}
+
+	if *replay {
+		rep, err := eng.SubmitReplay(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("replay: events=%d deliveries=%d pending=%d reviews=%d mismatches=%d replaced=%v\n",
+			rep.Events, rep.Deliveries, rep.Pending, rep.Reviews, rep.Mismatches, rep.Replaced)
+	}
 	return nil
 }
 

@@ -1,0 +1,10 @@
+{
+  "resourceType": "Observation",
+  "id": "EVT-5004",
+  "meta": {"fhirVersion": "4.0"},
+  "status": "final",
+  "subject": {"reference": "Patient/MRN-5004"},
+  "code": {"coding": [{"system": "LN", "code": "8867-4", "display": "Heart Rate"}]},
+  "valueQuantity": {"value": 72, "unit": "/min"},
+  "effectiveDateTime": "2026-09-13T07:30:00Z"
+}

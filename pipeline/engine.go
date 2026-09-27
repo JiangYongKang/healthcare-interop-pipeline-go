@@ -29,6 +29,21 @@ type Engine struct {
 	deid  *Deidentifier
 	store Store
 	sem   chan struct{}
+
+	replayQ   chan *replayTask
+	replayWG  sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// replayTask is one queued consistency-replay request.
+type replayTask struct {
+	res chan replayResult
+}
+
+type replayResult struct {
+	rep *ReplayReport
+	err error
 }
 
 // NewEngine builds an engine and opens (or replays) its output store.
@@ -40,14 +55,29 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{
-		cfg:   cfg,
-		regs:  formats.DefaultRegistry(),
-		norm:  NewNormalizer(),
-		deid:  NewDeidentifier(cfg.DeIDSalt),
-		store: st,
-		sem:   make(chan struct{}, cfg.MaxInFlight),
-	}, nil
+	e := &Engine{
+		cfg:     cfg,
+		regs:    formats.DefaultRegistry(),
+		norm:    NewNormalizer(),
+		deid:    NewDeidentifier(cfg.DeIDSalt),
+		store:   st,
+		sem:     make(chan struct{}, cfg.MaxInFlight),
+		replayQ: make(chan *replayTask, cfg.replayQueueCap()),
+	}
+	e.replayWG.Add(1)
+	go e.replayWorker()
+	return e, nil
+}
+
+// replayWorker drains the bounded replay queue one task at a time.
+// Replay is idempotent, so a queued task always runs to completion and
+// never leaves half-applied state behind.
+func (e *Engine) replayWorker() {
+	defer e.replayWG.Done()
+	for t := range e.replayQ {
+		rep, err := e.store.ReplayConsistency(context.Background())
+		t.res <- replayResult{rep, err}
+	}
 }
 
 // Ingest processes one raw message end to end. msgID is the upstream
@@ -268,8 +298,15 @@ func (e *Engine) commitPrepared(ctx context.Context, item *preparedIngest) *Resu
 		var ie *IngestionError
 		if errors.As(serr, &ie) {
 			r.Error = ie
-			r.Outcome = Outcome(d.Outcome)
-			r.Reason = d.Reason
+			if d != nil {
+				r.Outcome = Outcome(d.Outcome)
+				r.Reason = d.Reason
+			} else {
+				// Hard failure before any decision was journaled
+				// (e.g. store closed): no decision to attach.
+				r.Outcome = OutcomeRejected
+				r.Reason = ie.Reason
+			}
 			return r
 		}
 		r.Error = &IngestionError{Type: ErrUnavailable, Message: "persistence failure", Reason: "IO_ERROR", EventID: item.rec.EventID, Detail: serr.Error()}
@@ -285,13 +322,94 @@ func (e *Engine) Snapshot(ctx context.Context) ([]*Record, error) {
 	return e.store.Snapshot(ctx)
 }
 
+// Chain returns the de-identified consistency view of one event chain:
+// current effective version, every retained delivery with its source
+// and time relation, and all applied review conclusions.
+func (e *Engine) Chain(ctx context.Context, eventID string) (*ChainView, error) {
+	return e.store.Chain(ctx, eventID)
+}
+
+// Chains returns consistency views of all known event chains.
+func (e *Engine) Chains(ctx context.Context) ([]*ChainView, error) {
+	return e.store.Chains(ctx)
+}
+
+// PendingReviews lists event ids currently waiting for a conflict
+// review, in stable order.
+func (e *Engine) PendingReviews(ctx context.Context) ([]string, error) {
+	chains, err := e.store.Chains(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, c := range chains {
+		if c.Status == ChainPendingReview {
+			out = append(out, c.EventID)
+		}
+	}
+	return out, nil
+}
+
+// Review records and applies one review conclusion. Application is
+// idempotent by ReviewID: re-submitting the same conclusion returns the
+// original record flagged as duplicate and changes nothing.
+func (e *Engine) Review(ctx context.Context, req ReviewRequest) (*ReviewRecord, *Decision, error) {
+	if err := req.Validate(); err != nil {
+		return nil, nil, err
+	}
+	return e.store.ApplyReview(ctx, req)
+}
+
+// SubmitReplay enqueues a consistency replay on the bounded replay
+// queue. When the queue is full the configured overflow policy applies:
+// reject returns a STORAGE_CONFLICT error, degrade journals and skips;
+// both stay queryable in the decision journal. Replay itself rebuilds
+// state from the journals and atomically replaces in-memory state, so
+// historical reprocessing and incremental processing converge to the
+// same effective result.
+func (e *Engine) SubmitReplay(ctx context.Context) (*ReplayReport, error) {
+	t := &replayTask{res: make(chan replayResult, 1)}
+	select {
+	case e.replayQ <- t:
+	default:
+		reason := "replay backlog full"
+		switch e.cfg.OverflowPolicy {
+		case OverflowDegrade:
+			e.store.Note(ctx, "_replay", OutcomeDegraded,
+				"replay task backlog reached; replay skipped (degrade policy)")
+			return nil, nil
+		default:
+			e.store.Note(ctx, "_replay", OutcomeRejected,
+				"replay task backlog reached; reject policy")
+			return nil, &IngestionError{
+				Type: ErrStorageConflict, Message: "replay backlog full",
+				Reason: "REPLAY_BACKLOG_FULL", EventID: "_replay", Detail: reason,
+			}
+		}
+	}
+	select {
+	case r := <-t.res:
+		return r.rep, r.err
+	case <-ctx.Done():
+		return nil, &IngestionError{Type: ErrUnavailable, Message: "replay wait cancelled", Reason: "CANCELLED", EventID: "_replay"}
+	}
+}
+
 // Decisions returns the full traceable decision journal.
 func (e *Engine) Decisions(ctx context.Context) ([]*Decision, error) {
 	return e.store.Decisions(ctx)
 }
 
-// Close flushes all journals and releases resources.
-func (e *Engine) Close() error { return e.store.Close() }
+// Close stops the replay worker, flushes all journals and releases
+// resources. It is idempotent.
+func (e *Engine) Close() error {
+	e.closeOnce.Do(func() {
+		close(e.replayQ)
+		e.replayWG.Wait()
+		e.closeErr = e.store.Close()
+	})
+	return e.closeErr
+}
 
 func stripBOM(b []byte) []byte {
 	return []byte(strings.TrimPrefix(string(b), "\uFEFF"))

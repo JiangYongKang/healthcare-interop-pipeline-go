@@ -1,0 +1,10 @@
+{
+  "resourceType": "Observation",
+  "id": "EVT-5001",
+  "meta": {"fhirVersion": "4.0"},
+  "status": "final",
+  "subject": {"reference": "Patient/MRN-5001"},
+  "code": {"coding": [{"system": "LN", "code": "8310-5", "display": "Body Temperature"}]},
+  "valueQuantity": {"value": 36.8, "unit": "cel"},
+  "effectiveDateTime": "2026-09-10T09:00:00Z"
+}

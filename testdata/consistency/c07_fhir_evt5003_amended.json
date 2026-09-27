@@ -1,0 +1,10 @@
+{
+  "resourceType": "Observation",
+  "id": "EVT-5003",
+  "meta": {"fhirVersion": "4.0"},
+  "status": "amended",
+  "subject": {"reference": "Patient/MRN-5003"},
+  "code": {"coding": [{"system": "LN", "code": "8480-6", "display": "Systolic BP"}]},
+  "valueQuantity": {"value": 122, "unit": "mmHg"},
+  "effectiveDateTime": "2026-09-12T08:00:00Z"
+}
